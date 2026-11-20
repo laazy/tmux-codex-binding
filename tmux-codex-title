@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+
+ROLLOUT = re.compile(r"rollout-.+?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl")
+PANE_FORMAT = "#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{@codex_title_role}\t#{@codex_title_legacy}\t#{window_name}\t#{pane_title}"
+
+
+def tmux(socket, *args):
+    return subprocess.check_output(
+        ["tmux", "-S", socket, *args], text=True, stderr=subprocess.DEVNULL
+    ).rstrip("\n")
+
+
+def short_title(title, limit=16):
+    title = " ".join(title.split())
+    widths = [
+        0 if unicodedata.combining(char) else
+        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        for char in title
+    ]
+    if sum(widths) <= limit:
+        return title
+    used = 0
+    for pos, width in enumerate(widths):
+        if used + width >= limit:
+            return title[:pos].rstrip() + "…"
+        used += width
+    return title
+
+
+def launch(role):
+    socket = os.environ["TMUX"].split(",", 1)[0]
+    pane = os.environ["TMUX_PANE"]
+    tmux(socket, "set-option", "-p", "-t", pane, "@codex_title_role", role)
+    if role == "window":
+        tmux(socket, "set-option", "-w", "-t", pane, "automatic-rename", "off")
+    codex = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
+    os.execv(codex, [codex, "--no-daemon", "--yolo",
+                     "-c", 'tui.terminal_title=["thread-name"]'])
+
+
+def process_session(pid):
+    for fd in Path(f"/proc/{pid}/fd").glob("*"):
+        try:
+            target = fd.readlink()
+        except OSError:
+            continue
+        match = ROLLOUT.fullmatch(target.name)
+        if match:
+            return target.parents[4] / "session_index.jsonl", match[1]
+    return None
+
+
+def load_titles(path, indexes):
+    try:
+        mtime = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return {}
+    cached = indexes.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    titles = {}
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry.get("id"), str) and isinstance(entry.get("thread_name"), str):
+            titles[entry["id"]] = entry["thread_name"]
+    indexes[path] = mtime, titles
+    return titles
+
+
+def watch(socket):
+    lock_path = Path(socket).with_name(Path(socket).name + ".codex-title.lock")
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        indexes = {}
+        bound = {}
+        displayed = {}
+        while True:
+            try:
+                lines = tmux(socket, "list-panes", "-a", "-F", PANE_FORMAT).splitlines()
+            except subprocess.CalledProcessError:
+                return
+            live = set()
+            windows = set()
+            panes = [line.split("\t", 7) for line in lines]
+            # Registered primary panes own their windows even while Codex starts up.
+            reserved = {row[0] for row in panes if len(row) == 8 and row[4] == "window"}
+            for row in panes:
+                if len(row) != 8:
+                    continue
+                window, pane, pid, command, role, legacy, window_name, pane_title = row
+                if pane in live or command != "codex":
+                    continue
+                live.add(pane)
+                try:
+                    if role:
+                        session = process_session(pid)
+                        if not session:
+                            continue
+                        index, session_id = session
+                        if bound.get(pane) != (pid, session_id):
+                            tmux(socket, "set-option", "-p", "-t", pane, "@codex_session_id", session_id)
+                            if role == "window":
+                                tmux(socket, "set-option", "-w", "-t", window, "@codex_session_id", session_id)
+                            bound[pane] = pid, session_id
+                        title = load_titles(index, indexes).get(session_id, "")
+                        if role != "window":
+                            continue
+                    else:
+                        # Legacy clients expose a terminal title but may keep
+                        # the session log open in a separate Codex daemon.
+                        if window in reserved or (legacy != "on" and window_name != "codex"):
+                            continue
+                        title, separator, _ = pane_title.rpartition(" | ")
+                        if not separator:
+                            continue
+                        title = title.lstrip()
+                        if title and "\u2800" <= title[0] <= "\u28ff":
+                            title = title[1:].lstrip()
+                        if title.startswith("! "):
+                            title = title[2:]
+                        if legacy != "on" and title:
+                            tmux(socket, "set-option", "-p", "-t", pane, "@codex_title_legacy", "on")
+                            reserved.add(window)
+                    if title and window not in windows:
+                        windows.add(window)
+                        name = short_title(title)
+                        if displayed.get(pane) != (pid, name):
+                            tmux(socket, "rename-window", "-t", window, "--", name)
+                            displayed[pane] = pid, name
+                except (OSError, subprocess.CalledProcessError):
+                    # A pane can close or move between listing and updating it.
+                    continue
+            bound = {pane: item for pane, item in bound.items() if pane in live}
+            displayed = {pane: item for pane, item in displayed.items() if pane in live}
+            time.sleep(0.75)
+
+
+if sys.argv[1] == "watch":
+    watch(sys.argv[2])
+else:
+    launch(sys.argv[1])
