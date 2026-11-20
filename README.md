@@ -10,7 +10,9 @@
 
 把下面这句话复制给能访问你终端的 Agent。
 
-> 请读取 https://github.com/laazy/tmux-codex-binding/blob/main/AGENTS.md，按指南把 tmux-codex-binding 安装到我当前的 tmux server。保留我已有的会话和快捷键设置，并验证新开的 Codex 窗口能自动更新标题。
+```text
+请读取 https://github.com/laazy/tmux-codex-binding/blob/main/AGENTS.md，按指南把 tmux-codex-binding 安装到我当前的 tmux server。保留我已有的会话和快捷键设置，并验证新开的 Codex 窗口能自动更新标题。
+```
 
 ## English
 
@@ -22,4 +24,6 @@ Existing Codex windows can join in. The binding records the conversation ID so y
 
 Copy this prompt into an agent that can access your terminal.
 
-> Read https://github.com/laazy/tmux-codex-binding/blob/main/AGENTS.md and follow the guide to install tmux-codex-binding on my current tmux server. Preserve my existing sessions and key settings, and verify that a new Codex window updates its title automatically.
+```text
+Read https://github.com/laazy/tmux-codex-binding/blob/main/AGENTS.md and follow the guide to install tmux-codex-binding on my current tmux server. Preserve my existing sessions and key settings, and verify that a new Codex window updates its title automatically.
+```
