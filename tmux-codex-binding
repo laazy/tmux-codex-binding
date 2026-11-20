@@ -41,8 +41,18 @@ def launch(role):
     socket = os.environ["TMUX"].split(",", 1)[0]
     pane = os.environ["TMUX_PANE"]
     tmux(socket, "set-option", "-p", "-t", pane, "@codex_title_role", role)
+    tmux(socket, "set-option", "-p", "-t", pane, "remain-on-exit", "failed")
     if role == "window":
         tmux(socket, "set-option", "-w", "-t", pane, "automatic-rename", "off")
+    proxy = os.environ.get("TMUX_CODEX_PROXY")
+    if proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            os.environ[key] = os.environ[key.lower()] = proxy
+        for key in ("NO_PROXY", "no_proxy"):
+            entries = os.environ.get(key, "").split(",")
+            os.environ[key] = ",".join(dict.fromkeys(
+                item for item in [*entries, "localhost", "127.0.0.1", "::1"] if item
+            ))
     codex = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
     os.execv(codex, [codex, "--no-daemon", "--yolo",
                      "-c", 'tui.terminal_title=["thread-name"]'])
