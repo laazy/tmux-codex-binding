@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -11,6 +12,9 @@ import time
 import unicodedata
 
 ROLLOUT = re.compile(r"rollout-.+?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl")
+NOTICE_FORMAT = "#{session_id}\t#{window_id}\t#{window_index}\t#{@codex_turn_notice}"
+CLIENT_FORMAT = "#{client_name}\t#{session_id}\t#{window_id}"
+ACTION_REQUIRED = ("[ ! ] Action Required", "[ . ] Action Required")
 PANE_FORMAT = "#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{@codex_title_role}\t#{@codex_title_legacy}\t#{window_name}\t#{pane_title}"
 
 
@@ -20,21 +24,49 @@ def tmux(socket, *args):
     ).rstrip("\n")
 
 
-def short_title(title, limit=16):
-    title = " ".join(title.split())
-    widths = [
-        0 if unicodedata.combining(char) else
-        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-        for char in title
-    ]
-    if sum(widths) <= limit:
-        return title
+def column_width(char):
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def title_width(text):
+    return sum(map(column_width, text))
+
+
+def task_title(title, limit=16):
+    """Keep the action and subject, dropping filler before applying the width cap."""
+    original = " ".join(title.split())
+    label = re.sub(r"^(?:(?:请(?:帮我)?|帮我|麻烦(?:帮我)?|我想要?|如何|怎么)\s*)+", "", original)
+    label = re.sub(r"^(?:(?:please|help me|how to|I want to)\s+)+", "", label, flags=re.I)
+    label = re.sub(r"(?:一下|的步骤|的方法|的方案|的问题|的作用|的配置过程)$", "", label)
+    label = re.split(r"[，。；！？]|[,;]\s+|\s+[—–|]\s+", label, maxsplit=1)[0]
+    label = label.strip(" .!?？。") or original
+
+    if title_width(label) > limit:
+        # Long slugs read better when redundant connector words disappear.
+        label = re.sub(r"(?<=\w)-(?:of|the|on|to|for|in|and)(?=-\w)", "", label, flags=re.I)
+    if title_width(label) <= limit:
+        return label
+
     used = 0
-    for pos, width in enumerate(widths):
-        if used + width >= limit:
-            return title[:pos].rstrip() + "…"
-        used += width
-    return title
+    for pos, char in enumerate(label):
+        if used + column_width(char) >= limit:
+            prefix = label[:pos].rstrip()
+            # Keep complete words or slug components where there is space.
+            if char.isascii() and char.isalnum() and prefix and prefix[-1].isascii() and prefix[-1].isalnum():
+                boundary = max(prefix.rfind(" "), prefix.rfind("-"), prefix.rfind("_"))
+                if boundary >= limit // 2:
+                    prefix = prefix[:boundary].rstrip()
+            return prefix + "…"
+        used += column_width(char)
+    return label
+
+
+def compact_status(socket):
+    right = tmux(socket, "show-options", "-gv", "status-right")
+    autosave = re.search(r"#\([^\n)]*/tmux-continuum/scripts/continuum_save\.sh\)", right)
+    tmux(socket, "set-option", "-g", "status-right", autosave[0] if autosave else "")
 
 
 def launch(role):
@@ -55,7 +87,7 @@ def launch(role):
             ))
     codex = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
     os.execv(codex, [codex, "--no-daemon", "--yolo",
-                     "-c", 'tui.terminal_title=["thread-name"]'])
+                     "-c", 'tui.terminal_title=["activity","thread-name"]'])
 
 
 def process_session(pid):
@@ -66,7 +98,7 @@ def process_session(pid):
             continue
         match = ROLLOUT.fullmatch(target.name)
         if match:
-            return target.parents[4] / "session_index.jsonl", match[1]
+            return target, match[1]
     return None
 
 
@@ -90,6 +122,96 @@ def load_titles(path, indexes):
     return titles
 
 
+def completed_turn(path, offsets, since):
+    """Read new rollout events without publishing earlier turns after a reload."""
+    complete = False
+    with path.open("rb") as transcript:
+        size = os.fstat(transcript.fileno()).st_size
+        position = offsets.get(path)
+        if position is None or position > size:
+            position = max(0, size - 65536)
+            transcript.seek(position)
+            if position:
+                transcript.readline()
+        else:
+            transcript.seek(position)
+        while True:
+            position = transcript.tell()
+            line = transcript.readline()
+            if not line.endswith(b"\n"):
+                offsets[path] = position
+                break
+            try:
+                event = json.loads(line)
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event["payload"]
+                if payload.get("type") == "task_complete" and payload.get("last_agent_message"):
+                    complete |= datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")) >= since
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+    return complete
+
+
+def update_notices(socket, completed, blocked):
+    clients = [line.split("\t") for line in
+               tmux(socket, "list-clients", "-F", CLIENT_FORMAT).splitlines()]
+    selected = {window for _, _, window in clients}
+    attached = {session for _, session, _ in clients}
+    rows = [line.split("\t") for line in
+            tmux(socket, "list-windows", "-a", "-F", NOTICE_FORMAT).splitlines()]
+    locations = {}
+    for session, window, number, state in rows:
+        locations.setdefault(window, {})[session] = number
+    for _, window, _, state in rows:
+        if window not in locations:
+            continue
+        numbers = locations.pop(window)
+        if window in selected:
+            completed.discard(window)
+            desired = ""
+        elif window in blocked:
+            desired = "action"
+        elif window in completed or state == "done":
+            desired = "done"
+        else:
+            desired = ""
+        if desired == "done":
+            completed.discard(window)
+        if state == desired:
+            continue
+        try:
+            if not desired:
+                tmux(socket, "set-option", "-wu", "-t", window, "@codex_turn_notice")
+                continue
+            tmux(socket, "set-option", "-w", "-t", window, "@codex_turn_notice", desired)
+            name = tmux(socket, "display-message", "-p", "-t", window, "#W")
+            summary = "需要你处理" if desired == "action" else "已回复"
+            for session in attached.intersection(numbers):
+                message = f"窗口 {numbers[session]} · {name} {summary}"
+                tmux(socket, "display-message", "-t", f"{session}:", "-d", "2500",
+                     message.replace("#", "##"))
+        except subprocess.CalledProcessError:
+            continue
+
+
+def jump_to_action(socket, client, current_session):
+    candidates = []
+    for line in tmux(socket, "list-windows", "-a", "-F", NOTICE_FORMAT).splitlines():
+        session, _, number, state = line.split("\t")
+        if state == "action":
+            candidates.append((session != current_session, session, int(number)))
+    for _, session, number in sorted(candidates):
+        try:
+            tmux(socket, "switch-client", "-E", "-Z", "-c", client, "-t", f"{session}:{number}")
+            return
+        except subprocess.CalledProcessError:
+            # The target may have closed since we listed the windows.
+            continue
+    tmux(socket, "display-message", "-t", f"{current_session}:", "-d", "1600",
+         "没有需要审批或输入的 Codex 窗口")
+
+
 def watch(socket):
     lock_path = Path(socket).with_name(Path(socket).name + ".codex-title.lock")
     with lock_path.open("a") as lock:
@@ -100,12 +222,16 @@ def watch(socket):
         indexes = {}
         bound = {}
         displayed = {}
+        offsets = {}
+        started = datetime.now(timezone.utc)
+        completed = set()
         while True:
             try:
                 lines = tmux(socket, "list-panes", "-a", "-F", PANE_FORMAT).splitlines()
             except subprocess.CalledProcessError:
                 return
             live = set()
+            blocked = set()
             windows = set()
             panes = [line.split("\t", 7) for line in lines]
             # Registered primary panes own their windows even while Codex starts up.
@@ -117,12 +243,17 @@ def watch(socket):
                 if pane in live or command != "codex":
                     continue
                 live.add(pane)
+                if pane_title.startswith(ACTION_REQUIRED):
+                    blocked.add(window)
                 try:
                     if role:
                         session = process_session(pid)
                         if not session:
                             continue
-                        index, session_id = session
+                        transcript, session_id = session
+                        index = transcript.parents[4] / "session_index.jsonl"
+                        if completed_turn(transcript, offsets, started):
+                            completed.add(window)
                         if bound.get(pane) != (pid, session_id):
                             tmux(socket, "set-option", "-p", "-t", pane, "@codex_session_id", session_id)
                             if role == "window":
@@ -149,7 +280,7 @@ def watch(socket):
                             reserved.add(window)
                     if title and window not in windows:
                         windows.add(window)
-                        name = short_title(title)
+                        name = task_title(title)
                         if displayed.get(pane) != (pid, name):
                             tmux(socket, "rename-window", "-t", window, "--", name)
                             displayed[pane] = pid, name
@@ -158,10 +289,18 @@ def watch(socket):
                     continue
             bound = {pane: item for pane, item in bound.items() if pane in live}
             displayed = {pane: item for pane, item in displayed.items() if pane in live}
+            try:
+                update_notices(socket, completed, blocked)
+            except subprocess.CalledProcessError:
+                return
             time.sleep(0.75)
 
 
 if sys.argv[1] == "watch":
     watch(sys.argv[2])
+elif sys.argv[1] == "compact-status":
+    compact_status(sys.argv[2])
+elif sys.argv[1] == "jump":
+    jump_to_action(*sys.argv[2:])
 else:
     launch(sys.argv[1])
